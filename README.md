@@ -1,0 +1,1287 @@
+# llm-inference-bench
+
+LLM inference decode throughput benchmark with a Rich TUI dashboard.
+
+Measures token generation speed across a matrix of **concurrency levels** and **context lengths**, giving you a full picture of how your serving engine scales under load.
+
+Supports **SGLang**, **vLLM**, and **Flare** engines (auto-detected). Works with any OpenAI-compatible API (OpenRouter, Together AI, etc.).
+
+![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)
+
+![screenshot](screenshot.png)
+
+## Features
+
+- **Throughput matrix** — benchmarks every combination of concurrency (1, 2, 4, 8, ...) and context length (0K, 16K, 32K, 64K, 128K)
+- **Three benchmark layers** — prefill, sustained decode, and optional Burst / E2E decode
+- **Two decode entry points** — default duration-based Sustained Decode, plus request-count `--request-count` Burst / E2E-only mode
+- **Inline client latency detail** — aggregate decode cells can show `tok/s + TTFT/ITL` when there is enough terminal width
+- **Server-side validation** — optionally scrapes Prometheus `/metrics` for vLLM, SGLang, and Flare validation, queue, KV, and scheduler signals
+- **Live TUI dashboard** — adaptive Rich layout with compact modes for narrower terminals
+- **Decode loop guard** — detects sustained exact repetition in reasoning and content by default; invalid cells show an error instead of throughput
+- **Interactive output preview** — press `o` to view a request's output, Space to freeze the preview, PageUp/PageDown to browse, and End to return to live scrolling
+- **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency and CPU package temperatures when exposed by the host
+- **Fabric diagnostics** — bundled CUDA/NCCL P2P diagnostic plus AMD CPU NUMA/xGMI bandwidth and latency diagnostic
+- **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
+- **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
+- **Mixed prefill + decode** — `--mixed-prefill-contexts` measures the TTFT of a long prompt that arrives while other streams decode, against the same length alone, and what its prefill costs the running streams' decode throughput
+- **Scheduler tests** — `--scheduler all` runs seven load patterns against the server's scheduler (long-prompt arrivals under decode, bursts above the slot/lane limit, KV-filling agent conversations, short requests behind long prefills, overload and drain, abort storms, a long mixed soak), samples `/metrics`, detects stalls, and exits 2 when a scenario fails; `--sched-ab-fairness off,0.4` A/Bs vLLM's prefill compute share live on one server
+- **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
+- **Dataset accuracy profiles** — pinned GSM8K (1319 items), stratified MMLU-Pro (1000 items), and GPQA Diamond (198 items) benchmarks with per-item scoring, Wilson confidence intervals, and per-category accuracy, designed to measure quantization degradation (e.g. NVFP4 w4a16 vs w4a4)
+- **Paired A/B comparison** — `--compare-baseline` pairs two runs per item and reports accuracy delta, correct/wrong flips, exact McNemar significance, per-category deltas, and completion-token inflation
+- **Tool-calling quality** — `--tool-eval` runs [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) against the same server with the community leaderboard settings and reports its score, per-category results and Hard Mode capabilities
+- **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
+- **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
+- **JSON output** — structured results saved to `benchmark_results.json` for further analysis
+- **Smart test skipping** — reads KV cache budget from the server, automatically skips over-capacity cells
+- **Engine auto-detection** — automatically detects SGLang, vLLM, or Flare and adapts metric scraping
+- **Auto-update** — checks GitHub for new versions on startup, offers one-click upgrade
+
+## Installation
+
+See [CHANGELOG.md](CHANGELOG.md) for versioned methodology changes.
+Versioned source archives and the standalone benchmark script are available
+from [GitHub Releases](https://github.com/local-inference-lab/llm-inference-bench/releases).
+Use a source archive or repository checkout for the bundled datasets and
+fabric-diagnostic tools.
+
+```bash
+pip install httpx rich psutil
+```
+
+## Usage
+
+```bash
+# Default: localhost:5000, tests concurrency 1-128, contexts 0K-128K
+python3 llm_decode_bench.py
+
+# Custom port and parameters
+python3 llm_decode_bench.py --port 5199 --concurrency 1,2,4 --contexts 0,16384
+
+# Custom max tokens and test duration
+python3 llm_decode_bench.py --port 5001 --max-tokens 4096 --duration 60
+
+# Full standalone cold-prefill profile when debugging long-context ingest
+python3 llm_decode_bench.py --port 5001 \
+    --standalone-prefill --prefill-contexts 8k,16k,32k,64k,128k
+
+# Prefill-only communication sweep: no sustained decode matrix
+python3 llm_decode_bench.py --port 5001 \
+    --prefill-only --prefill-contexts 8k,64k,128k \
+    --display-mode plain --hw-monitor-interval 0.5
+
+# Mixed prefill + decode only: a 32k and a 128k prompt arriving while
+# 8 streams decode (TTFT alone vs under load, background tok/s around it)
+python3 llm_decode_bench.py --port 8000 --mixed-only \
+    --mixed-prefill-contexts 32k,128k --display-mode plain
+
+# Scheduler tests: all seven scenarios with a PASS/FAIL verdict per scenario
+# (exit code 2 on a failure, stall or wedge)
+python3 llm_decode_bench.py --port 8000 --scheduler all
+
+# A/B of vLLM's prefill compute share on one server (VLLM_SERVER_DEV_MODE=1),
+# arms switched live and interleaved off, 0.4, 0.4, off, ...
+python3 llm_decode_bench.py --port 8000 --scheduler arrivals,short-under-long \
+    --sched-ab-fairness off,0.4 --sched-ab-rounds 3
+
+# Burst / E2E-only mode: exactly N measured requests per cell
+python3 llm_decode_bench.py --port 5001 --skip-prefill \
+    --contexts 0 --concurrency 1,4 \
+    --request-count 40 --warmup-request-count 4 --max-tokens 64
+
+# Full report: prefill + sustained decode + short Burst / E2E section
+python3 llm_decode_bench.py --port 5001 \
+    --concurrency 1,4,8 --contexts 0,16k \
+    --duration 30 --run-burst --burst-requests-per-concurrency 5
+
+# Built-in completion-token statistics profile for the GLM long-context task
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia \
+    --profile-concurrency 8 \
+    --profile-runs 30 \
+    --max-tokens 40000
+
+# Same Estonia task with a generic high-reasoning-effort wrapper
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia-long \
+    --profile-concurrency 8 \
+    --profile-runs 30 \
+    --max-tokens 40000
+
+# Adaptive completion-token statistics profile search
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia \
+    --completion-stats-concurrency-levels 1,2,4,8,16,30 \
+    --completion-stats-min-results 30
+
+# GSM8K accuracy benchmark (full pinned 1319-item test set, temperature 0)
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile gsm8k
+
+# MMLU-Pro accuracy benchmark (pinned stratified 1000-question subset)
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile mmlu-pro
+
+# GPQA Diamond accuracy benchmark (198 graduate-level science questions;
+# fetched from the official password-protected zip on first use, cached locally)
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile gpqa-diamond
+
+# Quantization A/B: run the baseline quant first, then the candidate with a
+# paired per-item comparison (accuracy delta, flips, exact McNemar p-value)
+python3 llm_decode_bench.py --port 8001 --model GLM-5-w4a16 \
+    --test-profile gsm8k --output gsm8k_w4a16.json
+python3 llm_decode_bench.py --port 8002 --model GLM-5-w4a4 \
+    --test-profile gsm8k --output gsm8k_w4a4.json \
+    --compare-baseline gsm8k_w4a16.json
+
+# Standalone paired comparison of two earlier result files (no server needed)
+python3 llm_decode_bench.py \
+    --compare-baseline gsm8k_w4a16.json --compare-candidate gsm8k_w4a4.json
+
+# Quick subset run (evenly-spread deterministic 200-item slice)
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile mmlu-pro --profile-runs 200
+
+# Remote API with authentication (OpenRouter, Together AI, etc.)
+python3 llm_decode_bench.py --host https://openrouter.ai --api-key sk-or-... --model meta-llama/llama-3-70b
+
+# Skip prefill phase for quick decode-only testing
+python3 llm_decode_bench.py --skip-prefill --concurrency 1,2,4 --contexts 0
+
+# Manual KV cache budget (for vLLM where auto-detection is unreliable)
+python3 llm_decode_bench.py --port 5199 --kv-budget 692736
+
+# CUDA/NCCL P2P fabric diagnostic only
+python3 llm_decode_bench.py --p2pmark-only
+
+# AMD CPU socket fabric / NUMA diagnostic only
+python3 llm_decode_bench.py --amd-fabric-only
+
+# Tool-calling quality: tool-eval-bench with the community leaderboard settings
+# (a pinned tool-eval-bench is installed into its own cached venv on first use)
+python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval
+
+# Same, first a short subset of five scenarios
+python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval \
+    --tool-eval-args="--scenarios TC-01 TC-02 TC-03 TC-45 TC-85"
+```
+
+### Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--host` | `localhost` | Server hostname or full URL (e.g. `https://openrouter.ai`) |
+| `--port` | `5000` | Server port (ignored when `--host` is a URL) |
+| `--api-key` | | API key sent as `Authorization: Bearer` header |
+| `--model` | `Qwen3.5` | Model name for API requests (auto-detected from server) |
+| `--concurrency` | `1,2,4,8,16,32,64,128` | Comma-separated concurrency levels |
+| `--contexts` | `0,16384,32768,65536,131072` | Comma-separated context lengths (tokens) |
+| `--max-tokens` | `2048` | Max tokens to generate per request |
+| `--duration` | `30` | Duration per decode test cell (seconds) |
+| `--decode-warmup-seconds` | `3` | Hidden pre-measurement warmup at `C=1` using the largest requested context that fits current model/KV limits. Set `0` to disable |
+| `--loop-detection` / `--no-loop-detection` | enabled | Check each decode response for sustained exact repetition, including warmup. Confirmed loops invalidate the cell instead of reporting throughput |
+| `--display-mode` | `screen` | `screen` uses an alternate-screen dashboard; `live` uses inline updates; `plain` disables the dashboard. Press `o` for an output preview in `screen`/`live` mode |
+| `--prefill-contexts` | `8k,64k,128k` | Extra scout prefill contexts in default mode; standalone profile contexts with `--standalone-prefill` |
+| `--prefill-metric` | `client` | Prefill headline source: `client`, `auto`, or `prometheus`. `auto` adds Prometheus validation when available |
+| `--standalone-prefill` | `false` | Run the old repeated cold-prefill profile before decode |
+| `--prefill-only` | `false` | Run standalone cold-prefill profiling and exit before sustained decode; JSON and final table include hardware/PCIe summaries when hardware sampling is enabled |
+| `--mixed-prefill-contexts` | | Prompt lengths (k suffix) for the mixed prefill + decode phase, which runs after the other phases. Empty disables it. See [Mixed Prefill + Decode](#mixed-prefill--decode) |
+| `--mixed-decode-streams` | `8` | Background decode streams; each restarts with a fresh prompt when its request finishes |
+| `--mixed-decode-prompt-tokens` | `2048` | Prompt length of every background request (unique prompt per request) |
+| `--mixed-decode-max-tokens` | `1024` | `max_tokens` of every background request (`ignore_eos` unless `--respect-eos`) |
+| `--mixed-warmup-seconds` | `20` | Background decode time before the long prompt is sent (it also waits until every stream decodes) |
+| `--mixed-window-seconds` | `10` | Background throughput window before the prompt and after its first token; the background keeps running this long after the first token |
+| `--mixed-arrival-max-tokens` | `16` | `max_tokens` of the long prompt, alone and under load |
+| `--mixed-only` | `false` | Run only the mixed phase: no prefill rows, no sustained decode matrix (implies `--skip-prefill`) |
+| `--scheduler` | | Scheduler tests (a mode of its own): comma-separated scenarios or `all`. Options `--sched-*`. See [Scheduler Tests](#scheduler-tests) |
+| `--request-count` | `0` | Burst / E2E-only mode: measured requests per cell. `0` keeps Sustained Decode as the primary mode |
+| `--warmup-request-count` | `0` | Warmup requests to discard before each `--request-count` cell |
+| `--run-burst` | `false` | After sustained decode, run an additional short Burst / E2E matrix |
+| `--burst-request-count` | `0` | Measured requests per Burst / E2E cell. `0` means `concurrency × --burst-requests-per-concurrency` |
+| `--burst-warmup-request-count` | `0` | Warmup requests per Burst / E2E cell. `0` means `concurrency` |
+| `--burst-requests-per-concurrency` | `5` | Auto Burst / E2E measured request multiplier |
+| `--test-profile` | | Built-in task profile. `estonia` embeds the GLM long-context prompt inside the script and implies `--completion-stats` (`estonia-v1` is the legacy question tail, `estonia-long` adds a high-reasoning-effort wrapper); `hotel-lights` is a compact numeric reasoning test; `needle-checksum` is a greedy numerical-stability probe (one 8K retrieval and arithmetic prompt, 500 identical temperature-0 requests answered through a tool call). `gsm8k`, `mmlu-pro` and `gpqa-diamond` are pinned multi-item accuracy benchmarks for quantization A/B tests |
+| `--compare-baseline` | | Path to a previous dataset-profile results JSON; after the run, a paired per-item comparison (accuracy delta, flips, exact McNemar p, per-category deltas, token inflation) is printed and embedded in the output JSON |
+| `--compare-candidate` | | Standalone mode: compare `--compare-baseline` against this results JSON and exit without contacting a server |
+| `--profile-concurrency` | `0` | Fixed task-profile concurrency. `0` keeps adaptive probing |
+| `--profile-runs` | `0` | Fixed task-profile measured request count. `0` uses `--completion-stats-min-results` |
+| `--completion-stats` | `false` | Run adaptive completion-token statistics mode instead of the decode matrix |
+| `--completion-stats-min-results` | `30` | Minimum completed runs collected at the selected concurrency |
+| `--completion-stats-concurrency-levels` | `1,2,4,8,16,30` | Candidate concurrency levels for the adaptive probe |
+| `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness for custom `--prompt`/`--prompt-file` runs; empty disables scoring. Built-in profiles use their own typed scorer instead |
+| `--completion-stats-save-text` | `false` | Store full streamed output/reasoning/content text in JSON instead of only final answer/excerpts |
+| `--completion-stats-temperature` | | Sampling temperature for profile requests. Dataset profiles and `needle-checksum` default to `0`; `estonia*`, `hotel-lights` and custom prompts leave the server/model default unless set. The value used is recorded in result metadata |
+| `--completion-stats-top-p` | | Sampling top_p for profile requests. Omitted unless set; recorded in result metadata |
+| `--completion-stats-seed` | | Base sampling seed; run *i* is sent with `seed = base + i`, so resamples differ from each other but are identical across engines/quants |
+| `--completion-stats-stall-timeout` | `600` | Stall watchdog (seconds without a token) for profile streams; the run is closed and scored `STALL`. `0` disables |
+| `--completion-stats-request-timeout` | `0` | Per-request wall-clock limit (seconds) for profile streams; catches models that loop without stalling when `max_tokens` is omitted. Scored `TIMEOUT`. `0` disables |
+| `--reasoning-effort` | | Optional reasoning effort for completion-stats/test-profile requests: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Omitted by default |
+| `--hw-monitor-interval` | `2` | Live CPU/GPU hardware sampling interval in seconds |
+| `--hw-gpu-limit` | `8` | Maximum GPUs shown in the live hardware panel |
+| `--no-hw-monitor` | `false` | Disable live hardware sampling |
+| `--p2pmark` | `false` | Run the bundled CUDA/NCCL fabric diagnostic before the LLM benchmark and embed it in JSON |
+| `--p2pmark-only` | `false` | Run only the bundled fabric diagnostic and exit |
+| `--p2pmark-detail` | `false` | Print expanded P2P matrices and per-pair topology/latency tables; default report is compact |
+| `--p2pmark-mode` | `all` | Diagnostic mode: `bandwidth`, `latency`, `allreduce`, or `all` |
+| `--p2pmark-bin` | bundled | Override path to the `llm_p2pmark` binary; default also has an embedded fallback |
+| `--amd-fabric` | `false` | Run the bundled AMD CPU NUMA/xGMI fabric diagnostic before the LLM benchmark and embed it in JSON |
+| `--amd-fabric-only` | `false` | Run only the AMD CPU fabric diagnostic and exit |
+| `--amd-fabric-detail` | `false` | Print separate full AMD fabric matrices; default output is compact |
+| `--amd-fabric-bin` | sidecar/PATH | Override path to the `llm_amd_fabric` helper |
+| `--amd-fabric-size-mb` | `512` | Buffer size per NUMA bandwidth measurement |
+| `--amd-fabric-latency-mb` | `256` | Pointer-chase latency working-set size per NUMA node |
+| `--amd-fabric-threads` | `0` | Threads per NUMA node for bandwidth tests; `0` auto-selects up to 64 CPUs per node |
+| `--tool-eval` | `false` | Run tool-eval-bench against `--host`/`--port` and `--model` with the community leaderboard settings, then exit. See [Tool-calling quality](#tool-calling-quality-tool-eval-bench) |
+| `--tool-eval-seed` | `42` | tool-eval-bench `--seed` |
+| `--tool-eval-temperature` | `0` | tool-eval-bench `--temperature` |
+| `--tool-eval-parallel` | `4` | Scenarios run at once (tool-eval-bench `--parallel`) |
+| `--tool-eval-max-turns` | `30` | tool-eval-bench `--max-turns` per scenario |
+| `--tool-eval-timeout` | `600` | tool-eval-bench `--timeout` per request, in seconds |
+| `--tool-eval-hardmode` / `--no-tool-eval-hardmode` | on | Include the Hard Mode scenarios (tool-eval-bench `--hardmode`) |
+| `--tool-eval-args` | | More tool-eval-bench options, appended last, e.g. `--tool-eval-args="--scenarios TC-01 TC-02"` or `--tool-eval-args=--no-think`. Options the bench sets itself are refused |
+| `--tool-eval-ref` | pinned commit | tool-eval-bench commit, tag or branch to install and run; also `LLM_BENCH_TOOL_EVAL_REF` |
+| `--tool-eval-bin` | | Run an existing tool-eval-bench executable instead of installing one |
+| `--output` | `benchmark_results.json` | Output file path |
+| `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
+| `--skip-prefill` | | Skip prefill reporting entirely |
+
+## Standardized container benchmark (`lil-bench`)
+
+Karmic Kraken images ship this repository as `lil-bench`. With the model
+loaded and no other traffic, run it inside the serving container:
+
+```bash
+docker exec --privileged -it -e LIL_BENCH_TOKEN=lilb_... <container> lil-bench
+```
+
+`--privileged` applies only to the benchmark process. It lets `lil-bench` read
+the PCIe ACS settings of the GPUs' root ports and switches (whether
+peer-to-peer traffic is redirected through the CPU); without it everything
+else is measured and ACS is reported as unknown.
+
+Your identifier and the ready command are at
+<https://docker.local-inference-lab.ai/bench/token> (GitHub sign-in). The run
+takes about 15–30 minutes: hardware and PCIe inventory, p2pmark, prefill 32k
+and 128k, decode C1/C8/C16 at 0/64k/128k context, with GPU clocks, power and
+throttle reasons sampled throughout. The result is saved in the container at
+`/cache/lil-bench/<run>.json.gz` and uploaded to your private run list.
+
+p2pmark runs next to the loaded model in its own process: about 0.6 GiB per
+GPU for its CUDA context, 0.5 GiB more for the NCCL all-reduce comparison, and
+its copy buffers. It always leaves 256 MiB free on every GPU for the server
+(without the all-reduce comparison if only the copy and latency tests fit),
+starts only while the server has no requests, and is stopped at once if one
+arrives. vLLM keeps the memory it grows into under load, so after a first
+benchmark there is often no room left; later runs then reuse the p2pmark
+result of an earlier run on the same GPUs, driver and P2P settings since the
+last boot, marked as reused. On a nearly full configuration, run lil-bench
+first after the server starts.
+
+PCIe link speed changes that come with the GPU's P-state between idle and load
+are link power management, not errors. Replays, correctable errors, other link
+retraining, and a link that falls below its maximum generation or width under
+load are reported per phase and summarized per GPU.
+
+On a DGX Spark the GB10 GPU is integrated and shares the host's memory: it is
+recorded with `integrated` and `unified_memory`, its memory size is the host's
+`MemTotal`, and it has no PCIe link to check. A server that spans several
+machines (`--nnodes`) is measured from the container of node rank 0, which
+serves the API; the result records the node count in `server.nodes`.
+
+```bash
+lil-bench --no-upload          # measure and save only
+lil-bench --profile quick      # a few minutes, to test the setup
+lil-bench upload /cache/lil-bench/<run>.json.gz
+lil-bench inventory            # print the hardware/topology record
+```
+
+Without the image, run it from a checkout inside the container:
+`python3 -m lil_bench` (needs `httpx`, `rich`, and `pynvml`).
+
+### Collective diagnostics (`lil-bench collectives`)
+
+Which tensor-parallel all-reduce is fastest depends on how the GPUs reach each
+other: through a PCIe switch, peer writes ("push") are fast; when every GPU
+sits behind its own CPU host bridge or root port, writes (and on some hosts
+reads) to all peers at once can collapse while a ring keeps full speed.
+`lil-bench collectives` measures one tensor-parallel group of idle GPUs and
+uploads the result to <https://docker.local-inference-lab.ai/bench/collectives>,
+which prints a share link and collects statistics per topology, IOMMU mode and
+NVIDIA P2P driver setting. It needs PyTorch, cuda-python and FlashInfer with
+b12x, which the dedicated image provides:
+
+```bash
+docker pull ghcr.io/local-inference-lab/lil-collectives:latest
+docker run --rm --gpus all --privileged --ipc=host --shm-size 16g \
+  -v "$PWD":/cache/lil-bench \
+  -e LIL_BENCH_TOKEN=lilb_... ghcr.io/local-inference-lab/lil-collectives:latest
+#   --gpus 4,5,6,7   other GPUs (default: GPUs 0-3, TP4)
+#   --tp 2           two GPUs
+#   --quick          six sizes and one tuner effort, about five minutes
+#   -v lil-collectives-cache:/root/.cache   keep compiled kernels between runs
+```
+
+The run takes about 15 minutes at TP4:
+
+1. hardware and PCIe inventory (the same record as `lil-bench`), the peer path
+   of every GPU pair (shared switch, CPU root complex, host bridges, sockets),
+   IOMMU mode and the NVIDIA driver's P2P registry settings;
+2. peer bandwidth with SM copy kernels: one pair at a time, all peers at once,
+   a ring, one GPU to all peers, and all peers into one GPU, read and write;
+3. p2pmark (copy-engine bandwidth, latency, custom all-reduce vs NCCL);
+4. every FlashInfer/b12x all-reduce transport at every launch configuration
+   its joint tuner considers, for 1-192 rows of 5120 BF16 values, the fastest
+   configuration of each measured in steady state (two passes) and race style,
+   the tuner's own selection at default and audit effort, and NCCL with vLLM's
+   settings and with the ring algorithm forced. Every result is checked against
+   an FP32 reference.
+
+The result is also saved in the current directory (`collectives-<run>.json.gz`).
+`lil-bench collectives --report FILE...` prints saved results; to upload one
+later: `docker run --rm -v "$PWD":/cache/lil-bench -e LIL_BENCH_TOKEN=lilb_...
+--entrypoint lil-bench ghcr.io/local-inference-lab/lil-collectives upload
+/cache/lil-bench/collectives-<run>.json.gz`. Step-by-step instructions are on
+<https://docker.local-inference-lab.ai/bench/collectives>. The image recipe is in
+`docker/collectives/` (`build.sh FLASHINFER_TREE [TAG]`, `lock.sh` to refresh
+the pinned, hashed requirements).
+
+## Measurement Methodology
+
+### Prefill
+
+Prefill measures input processing speed. By default, prefill is based on scout
+requests. Every non-zero decode context already sends one scout request to
+populate the prefix cache before the measured decode cell, and the tool records
+that scout as a prefill sample. Contexts listed in `--prefill-contexts` that are
+not part of the decode matrix are measured once as lightweight scout-only
+samples, so default runs still include the 8k sanity point without restoring the
+old repeated standalone prefill phase.
+
+The headline metric is client-side `prompt_tokens / TTFT`. If the engine exports
+clean Prometheus prefill counters, standalone mode can also print a server-side
+validation value.
+
+Default integrated prefill contexts are the union of the non-zero decode
+contexts from `--contexts` and the configured `--prefill-contexts`. This removes
+the old extra repeated prefill phase from normal runs while still showing ingest
+numbers for the exact prompts used by decode and the small 8k sanity point.
+
+Use `--standalone-prefill --prefill-contexts 8k,16k,32k,64k,128k` when you need
+the old repeated cold-prefill curve. Use `--prefill-only` for focused ingest
+and PCIe communication sweeps; it implies `--standalone-prefill`, exits before
+decode, and keeps hardware sampling active even with `--display-mode plain`
+unless `--no-hw-monitor` is set.
+
+Use this section to compare long-context ingest speed. Do not mix it with decode
+throughput; they stress different parts of the engine.
+
+### Sustained Decode
+
+Sustained Decode is the default duration-based benchmark. Before the measured
+matrix starts, the default run performs one hidden `C=1` warmup at the largest
+requested context that fits the current model/KV limits. Each matrix cell then
+runs for `--duration` seconds after its own readiness warmup and keeps the
+requested concurrency saturated by restarting streams as they finish.
+
+Aggregate decode throughput uses OpenAI stream usage by default. For local
+vLLM, SGLang, and Flare this is exact when `continuous_usage_stats` is supported, because
+the stream exposes cumulative `completion_tokens` during the measured window.
+Prometheus generation counters are still collected as validation and for
+scheduler/effective-concurrency state, but they are not the default headline
+metric. If continuous usage is not available, the tool falls back to streamed
+content chunks and marks the aggregate source in JSON.
+
+Prometheus `/metrics` is optional. If SGLang is started without
+`--enable-metrics`, or if a remote server does not expose metrics, the benchmark
+prints a visible warning and continues with OpenAI stream metrics. In that mode,
+scheduler/effective-concurrency, KV auto-detection from metrics, and Prometheus
+validation fields are unavailable.
+
+Flare metrics support applies to the decode throughput benchmark. The separate
+`--scheduler` suite uses its generic OpenAI client fallback for Flare and does
+not collect Flare scheduler counters.
+
+Flare metrics provide active and queued requests, committed generation tokens,
+computed prefill tokens, and logical KV capacity. `flare_total_kv_tokens` already
+accounts for compressed storage and describes the pool on each tensor-parallel
+rank; the benchmark does not multiply it by rank count or physical page size.
+The scheduler drain check also waits for retiring slots, HTTP admission slots,
+and frontend workers before starting another cell.
+
+Flare speculation statistics keep two scopes separate. Acceptance length is
+`1 + accepted_draft_tokens / draft_request_rounds`, using progressing live
+request counters. Acceptance rate uses raw accepted/offered graph-record drafts,
+which can include work from cancelled lanes. Per-cell `server_flare_metrics`
+contains the counter deltas, verification and proposal graph counts and GPU
+times, raw emitted/offered/accepted counts, embedding cache hits and misses,
+and exposed embedding readiness time. Counter resets or changes in available
+counters invalidate this diagnostic window. Batched graph counts include
+padded lanes and terminal no-ops, so Flare does not populate acceptance-normalized
+step rates. Its offered-draft count for progressing live requests is unavailable
+(`server_spec_draft_tokens: null`); raw offered drafts remain in
+`server_flare_metrics.counter_delta.raw_offered_drafts`.
+
+Flare's committed generation count includes EOS and tokens withheld by text
+stops, so it can differ from client-visible output. Client usage remains the
+headline throughput source. Flare does not expose the prefill-duration histogram
+used by the server-side prefill calculation; prefill throughput therefore uses
+client time to first token rather than substituting total GPU time.
+
+Use this section as the main tuning/regression signal for kernels, NCCL, DCP,
+MTP, scheduler, and KV-cache changes. It answers: "How much decode throughput
+can the engine sustain once it is already running this concurrency?"
+
+### Decode loop detection
+
+Status: implemented. Sustained Decode and Burst / E2E Decode check each
+request's reasoning and content separately, including warmup requests. State
+does not cross request or channel boundaries. The guard is enabled by default;
+`--no-loop-detection` disables it for deliberately repetitive workloads such
+as a forced-token kernel diagnostic. Sampling parameters are unchanged.
+
+A confirmed structural loop contains at least **four identical cycles spanning
+4096 Unicode characters**. Shorter evidence (three cycles spanning at least
+1024 characters) is retained as `suspected` and does not invalidate throughput.
+Whitespace-only repetition is ignored. Checks run every 256 characters and at
+stream completion, independent of SSE chunk boundaries, over at most 131072
+characters per request/channel. The bounded search considers up to 64 matching
+suffix anchors and periods up to 32768 characters.
+
+When any worker confirms a loop, all requests belonging to that benchmark cell
+stop. Its throughput tables display `ERROR: loop` (stacked `ERROR` / `loop` in
+compact dashboard columns), not the speed of the repeated output. Cancellation
+uses the existing targeted SGLang abort and, when metrics are available,
+scheduler-drain checks; it does not send a server-wide abort. A drain timeout is retained
+in the invalid cell's `timeout_reason`; each following cell must still pass its
+own pre-request idle barrier. The JSON cell retains `loop_detected`,
+`loop_detection_enabled`, and bounded `loop_diagnostics`: channel, request ID,
+stream index, Unicode offsets, cycle length, cycle hash, and text excerpts.
+Invalid cells use the `aggregate_tps=-3` sentinel and `null` in the summary
+throughput matrix. They are excluded from throughput statistics. Pre-decode
+warmup evidence is stored in `metadata.decode_warmup_loop_diagnostics`.
+The detection setting is part of resume compatibility.
+
+Transport and server failures invalidate decode cells independently of the
+repetition guard. These cells display `ERROR`, retain `failure_reason` and
+`aggregate_tps=-4` in JSON, and have `null` summary throughput. A failure during
+warmup is not a zero-throughput measurement. Each subsequent cell must still
+pass the scheduler-idle barrier.
+
+This is an exact-text heuristic, **not a semantic quality evaluator**. It can
+miss paraphrased loops, periods outside the search limit, or repetition that
+does not reach the threshold before the request stops. Intentional verbatim
+repetition can trigger it. A result without a detected loop is not proof of a
+correct or coherent answer. Completion-statistics, task-profile, coding-peak,
+and standalone prefill modes do not use this decode-cell guard.
+
+### Live decode output preview
+
+Status: implemented. In an interactive terminal using `--display-mode screen`
+(the default) or `--display-mode live`, press `o` to open or close a model-output
+panel. It reads the benchmark's existing SSE stream; it creates no additional
+inference requests and does not change sampling.
+
+| Key | Action |
+|---|---|
+| `o` | Show or hide the panel |
+| Space | Freeze the displayed snapshot, or resume live scrolling |
+| PageUp / PageDown | Pause and page through the snapshot |
+| Home | Go to the beginning of retained history |
+| End | Return to the live output tail |
+| `[` / `]` | Select the preceding/following worker; collect its output from that point |
+| `s` / `q` | Skip the benchmark cell / finish the benchmark, unchanged |
+
+Only one selected worker is displayed, labeled with the concurrency, context,
+worker number, request ID, and reasoning/content boundaries. Answers from
+different workers are not interleaved. The panel retains up to 65536 Unicode
+characters of that worker's output, including while hidden. Selecting another
+worker clears live history. A paused snapshot stays readable while the HTTP
+reader continues collecting output; pressing End returns to that buffer.
+Pausing never pauses generation or benchmark timing, and loop detection still
+checks every worker. Model text is rendered literally, without terminal control
+characters or interpreted Rich markup.
+
+The panel is available in the sustained and request-count decode dashboards,
+not `--display-mode plain` or completion-statistics/task-profile dashboards.
+On short terminals, opening it reduces the space used by hardware and event
+panels. Close it with `o` to restore the dashboard layout.
+
+### Burst / E2E Decode
+
+Burst / E2E Decode is a finite client-facing request burst. It sends a fixed
+number of measured requests, waits until they complete, and reports:
+
+```text
+sum(completion_tokens) / profiling_wall_time
+```
+
+Enable it after the sustained matrix with `--run-burst`. By default it sends
+`concurrency × 5` measured requests and `concurrency` warmup requests per cell.
+Override with `--burst-request-count` and `--burst-warmup-request-count`.
+
+Use this section for community-facing "what happens if I throw a
+batch of N requests at the server?" numbers. It includes admission, scheduling,
+prefill/cache effects for that finite burst, and completion behavior. It should
+be compared separately from Sustained Decode.
+
+### Request-Count Only Mode
+
+`--request-count N` switches the primary decode cells to a request-count
+Burst / E2E-only model:
+
+- Send `--warmup-request-count` requests first and discard them.
+- Send exactly `N` measured requests per cell.
+- Wait for all measured requests to complete.
+- Compute aggregate throughput as `sum(completion_tokens) / profiling_wall_time`.
+
+This mode requests only final OpenAI usage chunks, not continuous usage chunks,
+so its request payload matches AIPerf-style finite burst measurements more
+closely. Continuous usage is reserved for duration-based Sustained Decode where
+the tool must measure inside an open time window.
+
+This mode is best when you want only finite request bursts without running the
+Sustained Decode matrix. For full reports, prefer `--run-burst` so both
+Sustained Decode and Burst / E2E Decode are present and labeled separately.
+
+If `--run-burst` is not set, the final report prints an explicit Phase 3 note:
+`Burst / E2E Decode: Not run`. This is the default to avoid doubling the runtime
+of a full matrix accidentally.
+
+### Mixed Prefill + Decode
+
+Prefill and decode share the GPU: a long prompt that arrives while other users
+decode waits longer for its first token than on an idle server, and the running
+streams slow down while it is prefilled. `--mixed-prefill-contexts 32k,128k`
+measures both sides, one context at a time, after the other phases
+(`--mixed-only` runs only this phase):
+
+1. **Alone.** A prompt of C tokens is streamed on an idle server
+   (`max_tokens` `--mixed-arrival-max-tokens`, 16); its TTFT is `ttft_alone_s`.
+2. **Background.** `--mixed-decode-streams` (8) streams decode prompts of
+   `--mixed-decode-prompt-tokens` (2048) tokens with `max_tokens`
+   `--mixed-decode-max-tokens` (1024, `ignore_eos`). A stream whose request
+   finishes starts the next one at once. They stream with
+   `"stream_options": {"include_usage": true, "continuous_usage_stats": true}`,
+   and their tokens are counted from the increase of `usage.completion_tokens`
+   per chunk, not from chunks: with MTP / speculative decoding one chunk can
+   carry several tokens.
+3. **Arrival.** After `--mixed-warmup-seconds` (20 s), and once every stream has
+   produced a token, a second prompt of C tokens is sent; its TTFT is
+   `ttft_under_load_s`.
+4. The background keeps running `--mixed-window-seconds` (10 s) after the
+   arrival's first token, then stops.
+
+The report gives per context: `ttft_alone_s`, `ttft_under_load_s`, `slowdown`
+(under load / alone), the prompt tokens from `usage.prompt_tokens`, prefill
+tok/s of both requests, and the background decode tok/s in three windows: the
+10 s before the arrival is sent (`bg_tok_s_before`; shorter only when the warmup
+after the last stream started decoding was shorter), from its send to its first
+token, i.e. during its prefill (`bg_tok_s_during`), and the 10 s after its first
+token (`bg_tok_s_after`). `bg kept` is during / before. Errors of the reference,
+the arrival and every background stream are listed per context; a context that
+does not fit `max_model_len` or the KV budget (`streams × (prompt + max_tokens)
++ C`) is skipped with the reason.
+
+Every prompt is the bench's calibrated filler text with a unique leading tag
+(reference, arrival, each background request), so none is served from the
+prefix cache. In the default `--token-targeting estimate` mode, long prompts
+land within about 2% of C, and short ones such as the 2048-token background
+prompts come out roughly 100–150 tokens longer (chat template and question);
+`--token-targeting exact` builds every length through `/tokenize`. The JSON
+records the actual counts. Before the first context, one prefill of
+`min(8k, smallest C)` tokens warms the server up outside the measurement.
+`--temperature`, `--forced-token-id`, `--respect-eos`, `--no-loop-detection`,
+`--api-key` and `--cell-warmup-timeout-seconds` (how long to wait for every
+background stream to decode) apply to the phase as to decode cells. A confirmed
+decode loop in a background stream is reported as `ERROR: loop` next to its
+tok/s. Press `s` to skip the running context.
+
+`--output` gets a `mixed_prefill` section keyed by C (and the settings under
+`metadata.mixed_prefill`):
+
+```json
+"mixed_prefill": {
+  "32768": {
+    "context": 32768, "status": "ok",
+    "ttft_alone_s": 1.292, "ttft_under_load_s": 2.326, "slowdown": 1.8,
+    "prompt_tokens_alone": 32274, "prompt_tokens_under_load": 32274,
+    "prefill_tok_s_alone": 24971.9, "prefill_tok_s_under_load": 13874.5,
+    "bg_tok_s_before": 1181.0, "bg_tok_s_during": 469.9, "bg_tok_s_after": 1175.1,
+    "bg_during_vs_before": 0.398,
+    "windows": {
+      "before": {"start_s": -10.0, "end_s": 0.0, "seconds": 10.0, "tokens": 11810, "tok_s": 1181.0},
+      "during": {"start_s": 0.0, "end_s": 2.326, "seconds": 2.326, "tokens": 1093, "tok_s": 469.9},
+      "after": {"start_s": 2.326, "end_s": 12.326, "seconds": 10.0, "tokens": 11751, "tok_s": 1175.1}
+    },
+    "background": {"streams": 8, "streams_decoding_at_arrival": 8, "prompt_tokens": 2176,
+                   "max_tokens": 1024, "warmup_s": 20.081, "requests_started": 40,
+                   "requests_completed": 32, "errors": 0, "token_source": "usage"},
+    "timeline": {"bin_seconds": 1.0, "first_bin_start_s": -20.0, "tok_s": [987.0, 1188.0, 1200.0]},
+    "errors": [], "warnings": [], "loop_detected": false
+  }
+}
+```
+
+(Abridged; numbers from a stub server, not a GPU.) Window times are seconds
+relative to the arrival's send. `timeline` holds the background tok/s in 1 s
+bins over the whole background run, for plotting the dip.
+
+### Scheduler Tests
+
+`--scheduler` is a mode of its own: it runs load patterns that exercise the
+serving engine's scheduler from the outside (admission, prefill/decode
+interleaving, fairness, queueing, aborts) and gives every scenario a verdict.
+It works against vLLM and SGLang, and against any OpenAI-compatible endpoint
+with fewer server-side numbers.
+
+```bash
+# everything, with the defaults (35-40 minutes)
+python3 llm_decode_bench.py --port 8000 --scheduler all --output sched.json
+
+# quick regression gate
+python3 llm_decode_bench.py --port 8000 --scheduler burst,abort-storm,overload --sched-duration 60
+```
+
+| Scenario | What it does | What it checks / reports | Caught before |
+|----------|--------------|--------------------------|---------------|
+| `arrivals` | `--sched-streams` (max running − 1, ≤ 16) streams decode continuously; after `--sched-warmup` a unique `--sched-arrival-context` (32k) prompt arrives every `--sched-arrival-period` (20 s) for `--sched-duration` (180 s) | decode tok/s inside / outside the arrivals' prefill windows (`decode_kept`), gaps between streamed chunks p50/p99/max, arrival TTFT | the prefill compute share A/B on GLM-5.3 (decode during a prefill 61 → ~410 tok/s, arrival TTFT 4.4 → 8.9 s) |
+| `burst` | `--sched-burst-requests` (2 × max running, 8–64) prompts of `--sched-burst-context` (30k) sent at once | every request must finish; TTFT in send order, order inversions (0 = FCFS), wall time | the parallel-prefill lane deadlock (LIL vLLM #959): with `--max-num-seqs 4 --max-parallel-prefills 2`, 8 × 31.5k prompts finished 0/8 in 600 s before the fix, 8/8 in 20 s after |
+| `agents` | `--sched-agents` (8) agents with token-ID conversations starting at 40k–100k tokens, + 300–4000 response and 1k–6k tool tokens per turn, 0–3 s think, for `--sched-agents-duration` (600 s); contexts outgrow the KV pool | every turn must succeed; per-minute rows: turns, turn time, TTFT, tok/s, running, waiting, KV %, preemptions, prefix-cache hit % | the restore-admission stall (LIL vLLM #946): GLM-5.3-Flash with LMCache, 3.8 GB KV pool, `--max-num-seqs 4`: requests running, KV ~98 %, all token counters frozen |
+| `short-under-long` | Poisson shorts (`--sched-short-rate` 2/s, 256-token prompts, 16 tokens) alone for `--sched-short-baseline-seconds` (30 s), then with long prompts arriving as in `arrivals` | short TTFT baseline vs under load vs while a long prompt prefills (`slowdown_p99`) | head-of-line blocking of short requests behind long prefills |
+| `overload` | closed-loop probe at max running for `--sched-overload-probe-seconds` (30 s) → capacity in req/s; open-loop Poisson at `--sched-overload-factor` (2) × capacity for `--sched-duration`; then a drain | no timeouts / transport errors (HTTP rejections are counted), server drains to idle, probe request after the drain; queue depth, waiting by reason, TTFT growth by thirds | — |
+| `abort-storm` | `--sched-abort-waves` (3) waves of `--sched-abort-requests` (2 × max running, 8–64) `--sched-abort-context` (16k) prompts: a third cancelled after 0.05–2 s, a third after 1–64 tokens, a third completes | server idle after every wave within `--sched-idle-timeout`, the completing third finishes, probe after the storm succeeds | cancel / abort leaks (requests that stay running or keep KV after the client is gone) |
+| `soak-mix` | `--sched-soak-concurrency` (8) workers for `--sched-soak-duration` (600 s): 1k–160k token prompts with 64–1024 output tokens; `--sched-soak-images` adds chat requests with 1–10 JPEGs up to 6000×4000 (needs Pillow and a vision model) | no request fails, no stall | — |
+
+**Verdicts.** `PASS`; `FAIL` (a check failed, listed in the report);
+`STALLED` (requests were in flight, or running/waiting on the server, but for
+`--sched-stall-seconds` (90 s) no token was streamed, no request finished and
+none of the server's prompt / generation token counters, finished-request
+counter, prefill backlog or compute-seconds counters moved); `WEDGED` (a
+stall that lasted `--sched-stop-after-stall` (120 s): the scenario is stopped
+and the remaining ones are skipped, because the server needs a restart);
+`SKIPPED` (does not fit the server, with the reason); `ERROR`. The exit code
+is 0 when nothing failed, 2 when any scenario is FAIL / STALLED / WEDGED /
+ERROR, 1 when the run could not start. A stall threshold must be longer than
+the longest single prefill the server needs, so raise `--sched-stall-seconds`
+for very long prompts on slow servers.
+
+**Sizing.** Scenarios size themselves from the server: `max_model_len` from
+`/v1/models`, the KV pool from `vllm:cache_config_info` (or SGLang's
+`max_total_num_tokens`), and the running-request limit from SGLang's
+`/get_server_info` or the `--max-num-seqs` of a local vLLM process on that port
+(vLLM's default 256 when the command line has none). For a remote vLLM pass
+`--sched-max-running`. Prompts that do not fit are capped, with a note.
+
+**Prompts.** Every prompt is a unique random sequence of token IDs taken from
+the server's own tokenization of ordinary text (`POST /tokenize`) and sent to
+`/v1/completions`, so lengths are exact and nothing hits the prefix cache
+unless a scenario reuses a prefix on purpose (agents). Servers without
+`/tokenize` get unique padding text. Requests stream with
+`continuous_usage_stats` and `ignore_eos`; `--temperature` applies.
+
+**A/B on one server.** Two servers of the same build differ a lot from each
+other (a scheduler change can drown in replica noise), so
+`--sched-ab-fairness off,0.4` switches vLLM's prefill compute share on the
+running server through its dev endpoint `/prefill_fairness` (start the server
+with `VLLM_SERVER_DEV_MODE=1`; arms are `off`, `auto` or a share in (0, 1)).
+Every scenario runs once per arm and round in ABBA order
+(`--sched-ab-rounds`, 2), the endpoint's state is recorded with every run, the
+original policy is restored at the end, and the report adds a table per
+scenario with every headline metric per arm (mean and min–max over rounds).
+
+**Reproducing the known bugs.** Lane deadlock: start vLLM with
+`--max-num-seqs 4 --max-parallel-prefills 2` and run
+`--scheduler burst --sched-burst-requests 8 --sched-burst-context 31k`; a build
+without the fix ends WEDGED. Restore stall: GLM-5.3-Flash with LMCache, a
+3.8 GB KV pool (`--kv-cache-memory-bytes 3800000000`) and `--max-num-seqs 4`,
+then `--scheduler agents --sched-agents 12 --sched-agents-duration 1800`.
+
+Other options: `--sched-metrics-interval` (2 s), `--sched-request-timeout`
+(600 s), `--sched-seed` (7), `--sched-stream-prompt-tokens` (512),
+`--sched-stream-max-tokens` (2048), `--sched-burst-max-tokens` (32),
+`--sched-agent-start`, `--sched-agent-tool`, `--sched-agent-response`,
+`--sched-agent-think` (ranges such as `40k-100k`), `--sched-short-prompt-tokens`,
+`--sched-short-max-tokens`, `--sched-overload-prompt-tokens` (2048),
+`--sched-overload-max-tokens` (256). `python3 llm_decode_bench.py --help` lists
+them all.
+
+The console prints a progress line every 15 s per scenario (client requests in
+flight, server running / waiting, KV %, generation tok/s) and a result line per
+scenario, then a summary table. `--output` gets:
+
+```json
+{
+  "metadata": {"mode": "scheduler", "version": "0.8.0", "settings": {...}, "argv": [...]},
+  "server": {"engine": "vllm", "max_model_len": 202752, "kv_tokens": 1048576, "max_running": 16,
+             "max_running_source": "server command line", "prompt_mode": "token_ids",
+             "prefill_fairness": {"prefill_compute_share": 0.4, "max_parallel_prefills": 2, ...},
+             "local_command": {"options": {"max-num-seqs": "16", ...}}},
+  "scheduler": {
+    "verdict": "pass",
+    "scenarios": [{
+      "scenario": "burst", "arm": null, "status": "pass", "elapsed_s": 41.2,
+      "checks": [{"check": "every request finished", "ok": true, "detail": "16/16 completed, ..."}],
+      "headline": {"completed": 16, "wall_s": 38.9, "ttft_p50_s": 12.1, ...},
+      "metrics": {...},
+      "server": {"max_running": 16, "max_waiting": 0, "max_kv_usage_pct": 61.0, "preemptions": 0,
+                 "prefix_hit_pct": 0.0, "histograms": {"ttft": {"count": 16, "p50_s": 11.8, ...},
+                 "queue_time": {...}}},
+      "stalls": [], "client": {...}, "notes": [], "timeseries": [{"t": 0.0, "running": 0, ...}, ...]
+    }],
+    "ab": {}
+  },
+  "methodology": {"common": "...", "burst": "..."}
+}
+```
+
+`timeseries` holds every `/metrics` sample of the scenario (running, waiting,
+waiting by reason, KV usage, token and preemption counters, prefix-cache
+counters, the prefill compute share and backlog of the LIL scheduler); the
+`server.histograms` entries are the server's own TTFT, queue-time, prefill-time,
+inter-token-latency and end-to-end histograms over the scenario.
+
+### Completion-Token Statistics
+
+`--test-profile estonia` is the built-in long-answer task benchmark for the
+GLM-5.1 dense MLA vs NSA style test. `--test-profile estonia-long` uses the same
+task with a generic high-reasoning-effort system message and wrapper that ask
+the model to do a slower private pass and verification pass before answering,
+without adding task-specific chain or decoy hints. It uses
+`max_completion_tokens` for the generation cap and sends MiMo `thinking.enabled`
+as a profile request override. The long prompt is embedded directly in
+`llm_decode_bench.py` as a compressed blob, so the benchmark can be run from a
+single script without copying `testLuke5.txt` around. The important questions are:
+
+- how many decode tokens the model needs before it reaches the final answer,
+- whether the final answer is correct,
+- which parallel decode concurrency gives the best aggregate throughput for
+  this task.
+
+The mode uses the OpenAI-compatible chat/completions stream and does not run the
+normal context/concurrency decode matrix. It sends one optional `max_tokens=1`
+scout request first to populate the server prefix cache. Measured requests then
+reuse the exact same prompt so engines with prefix caching can avoid repeated
+prefill and focus the benchmark on parallel decode.
+
+For explicit, reproducible profile runs, use fixed concurrency:
+
+```bash
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia \
+    --profile-concurrency 8 \
+    --profile-runs 30
+```
+
+Without explicit profile controls, `estonia` and `estonia-long` default to
+`--profile-concurrency 30 --profile-runs 30`; override these when the server
+cannot fit that much parallel work or when you want a smaller diagnostic run.
+The example above sends exactly 30 measured requests with up to 8 requests in flight. The
+live display shows the scout request, queued/launched/active request counts,
+active stream elapsed time, estimated live tokens, estimated live tok/s, recent
+final answers/excerpts, running completion-token percentiles, correctness rate,
+TTFT, generation throughput, and the same live GPU/CPU hardware panel used by
+the normal decode dashboard in the top-right area while the run is still in
+progress. The scout row is reported as prefix-cache/prefill measurement with
+prompt tokens, TTFT, and prefill tok/s; it is not scored as a normal answer.
+Press `q` to stop after the currently completed work and print a partial report.
+
+If `--profile-concurrency` is not set, the adaptive flow is:
+
+- run the prefill scout once, unless `--completion-stats-no-prefill-scout` is set,
+- run a pilot/probe at C=1,
+- probe the configured concurrency levels,
+- stop once aggregate generation throughput no longer improves by
+  `--completion-stats-min-improvement` for `--completion-stats-patience` levels,
+- collect additional runs at the selected concurrency until
+  `--completion-stats-min-results` completed answers are available.
+
+The final report prints per-concurrency probe rows and a selected-concurrency
+summary with completion-token avg/p50/p90/p99, elapsed time, TTFT, aggregate
+generation tok/s, max-token hits, and the pass rate when scoring is enabled.
+
+#### How answers are scored
+
+Only the model's **visible** answer is scored. Reasoning streamed in a separate
+`reasoning`/`reasoning_content` field, or inline `<think>…</think>` blocks
+inside `content`, is recorded for token statistics but never read for
+correctness: a truncated thinking trace that happens to mention the right value
+is not an answer. An explicit `Final answer:` / `Answer:` line wins; otherwise
+the last non-empty line is used (markdown emphasis, bullets and trailing
+punctuation are stripped).
+
+- `estonia`, `estonia-v1`, `estonia-long` use the `country_exact` scorer. It
+  extracts the country the answer *asserts*: negated mentions (`not Latvia`),
+  parenthetical asides next to an asserted country (`…in Estonia (not Latvia…)`)
+  and superseded values (`from Latvia to Estonia`) do not count. Labels:
+  `PASS`, `DECOY` (committed to the planted wrong country, Latvia),
+  `NOT_STATED` (the model says the packet does not contain the answer, i.e. it
+  gave up), `AMBIG` (one conclusion line asserts two countries; scored wrong
+  and flagged for manual review), `FAIL` (another country or no country).
+- `hotel-lights` uses a strict `numeric_exact`: a bare-number line, a number
+  anchored at the end of the line (`= 48`, `answer is 48`, `Final answer: 48`)
+  or a line whose only number is neither negated nor hedged. `Not 48`,
+  `47, not 48` and `48 rooms out of 100` are `unparseable` (FAIL with the
+  reason shown), not a pass or a "got 100".
+- Runs that never produced a visible answer are labelled by *why*: `TRUNC`
+  (hit `max_tokens`), `STALL` (no token within `--completion-stats-stall-timeout`)
+  or `TIMEOUT` (`--completion-stats-request-timeout`), glyph `⊘`. They count
+  as not-correct in the headline pass rate — the model did not deliver — but
+  they are runtime/budget artifacts, so the report also prints `pass rate,
+  finished runs only` and lists every label with a count
+  (`PASS 19 / FAIL 0 / DECOY 4 / NOT_STATED 5 / TRUNC 2`). A cancelled run
+  (`q`) is `CANCEL` and not scored.
+- `needle-checksum` uses the `needle_checksum` scorer on the streamed tool call:
+  exactly one `submit_context_check` call with integer `alpha`, `beta`,
+  `gamma` and `checksum`. Labels: `EXACT` (478, 788, 426, 3332), `NEAR_MISS`
+  (checksum 3330 with the right facts, the model's known last-digit slip),
+  `WRONG_SUM` (another checksum), `WRONG_FACTS` (a wrongly retrieved value) and
+  `FAIL` (no call, several calls or malformed arguments).
+- `--prompt` / `--prompt-file` runs fall back to `--completion-stats-correct-regex`
+  on the extracted answer line.
+
+The `estonia` prompt is **v2** since 0.4.31: the 700k-character packet is
+byte-identical, only the question tail changed. It names the *vendor
+(manufacturer)* — the packet links a vendor account, it never uses the word
+"manufacturer" — and asks for exactly one `Final answer: <country>` line so the
+scorer can parse an asserted country. `estonia-v1` (alias `estonia-legacy`)
+keeps the old bare `Question:/Answer:` tail for comparison with older reports.
+Result metadata records `profile_version`, `scorer_version` and the sha256 of
+the prompt actually sent; `--compare-baseline` warns when they differ.
+
+#### Why 30 runs of the same prompt give different answers
+
+`estonia*` and `hotel-lights` are *resample consistency* tests: the same
+prompt is sent N times and the metric is the pass rate plus the completion
+tokens needed. Sampling is therefore stochastic on purpose. The profiles do
+not pin temperature or top_p; requests run on the server/model default (the
+model's own `generation_config.json` under vLLM) unless you pass
+`--completion-stats-temperature` / `--completion-stats-top-p`. Whatever was
+used is recorded in result metadata and printed in the Configuration panel.
+For A/B runs across engines or quantizations, set both explicitly so both
+sides sample identically, and add `--completion-stats-seed BASE` to send
+`seed = BASE + run_index`, which keeps the N samples distinct but reproducible.
+The estonia packet contains planted decoys (Mirel Industrial in Latvia,
+K-27B/V-447, AR-13, MX-86/N-2), so wrong answers are almost always the decoy
+country or "not stated" — that split is the signal the report shows.
+
+If `--max-tokens` is not explicitly provided in this mode, the tool defaults to
+the built-in profile default, currently `40000` for `estonia` and
+`estonia-long` and *no cap* for `hotel-lights` (the model decides when to
+stop). Uncapped runs are guarded by the stall watchdog (default 600 s without a
+token) and, optionally, a per-request wall-clock limit
+(`--completion-stats-request-timeout`) for models that loop without ever
+stalling. `--prompt` and `--prompt-file` remain available for custom
+completion-token statistics, but the reproducible bundled task should use
+`--test-profile estonia` or `--test-profile estonia-long`.
+
+If SGLang is running with DCP/CP and `/get_server_info` reports only the local KV
+budget, pass `--dcp-size N` or set `LLM_BENCH_DCP_SIZE=N`. For example, a local
+`max_total_num_tokens=200000` with `--dcp-size 4` is displayed and treated as an
+effective `800000` token KV budget.
+
+#### needle-checksum: greedy numerical stability
+
+`--test-profile needle-checksum` (aliases `needle`, `checksum`, `checksum-3332`)
+is logprobz's GLM-5.3-Flash checksum probe, rebuilt exactly: the system and user
+messages plus the tool schema hash to the original `7349ff46…`. An 8K-token
+synthetic dataset of 291 inert `REC` lines hides three `CANONICAL FACT` values
+(ALPHA 478, BETA 788, GAMMA 426). The model must retrieve them, compute
+`ALPHA + 2*BETA + 3*GAMMA = 3332` and submit the result through one
+`submit_context_check` tool call, with thinking at `reasoning_effort: max`.
+
+The profile sends that one prompt 500 times at concurrency 8 with temperature 0,
+top_p 0.95, seed 275001 and a 4096-token cap. Greedy, identical requests should
+all agree, so every wrong answer measures the serving stack's numerics, not
+sampling. GLM-5.3-Flash has a near-tie on the last digit of `478 + 1576 + 1278`,
+and the typical wrong answer is `NEAR_MISS` (3330). It is a cheap canary for
+numerical changes such as MoE activation precision or kernel changes, not a
+general quality benchmark.
+
+The tool call is part of the test. With a plain answer line instead,
+GLM-5.3-Flash computes the sum step by step (`2054 + 1278`) and passed 500/500
+in every configuration below. The server must therefore have tool calling
+enabled (vLLM `--enable-auto-tool-choice` with the model's tool parser).
+
+Reference results on GLM-5.3-Flash TP4 with MTP, 4× RTX PRO 6000 Max-Q,
+Karmic Kraken beta, 500 requests per cell:
+
+| Checkpoint and MoE activations | wrong at C8 (default) | wrong at C30 |
+|---|---|---|
+| QAD (HF main), b12x W4A4 (profile default) | 6.0% | 9.0% |
+| QAD, b12x W4A16 (BF16 router weights) | 0% | 0% |
+| QAD, b12x W4A16 + `B12X_W4A16_FP32_TOPK_WEIGHTS=1` | 0% | 0% |
+| pre-QAD `46aaae8a`, b12x W4A16 (BF16 router weights) | 18.0% | 23.2% |
+
+Higher concurrency adds batch-composition noise, so compare runs at the same
+`--profile-concurrency`. logprobz reports DeepSeek V4 and V4.1 Flash at 500/500,
+so the probe mainly tells GLM-5.3-Flash configurations apart.
+
+### Dataset Accuracy Profiles (gsm8k, mmlu-pro, gpqa-diamond)
+
+`--test-profile gsm8k`, `--test-profile mmlu-pro`, and `--test-profile
+gpqa-diamond` are multi-item accuracy benchmarks built on the completion-stats
+machinery. Instead of repeating one prompt, every measured request is a
+**different pinned dataset item**, so the reported correctness rate is dataset
+accuracy, not a resample pass-rate. They are intended as sensitive, externally
+comparable anchors for quantization and engine A/B tests (for example NVFP4
+`w4a16` vs `w4a4` of the same checkpoint).
+
+Datasets are pinned by sha256 and resolved in this order: `data/<file>` next to
+the script, `~/.cache/llm_decode_bench/datasets/`, then download from the pinned
+source with hash verification. A hash mismatch is a hard error, so two machines
+can never silently measure different item sets.
+
+- `gsm8k` — the full official GSM8K test split (1319 grade-school math word
+  problems, MIT license, downloaded verbatim from `openai/grade-school-math`).
+  The model is asked to end with the final number alone on the last line;
+  scoring is exact final-number match (thousands separators, `$`/`%` and
+  trailing punctuation are tolerated). Multi-step generation makes this the
+  most quantization-sensitive standard task benchmark that is still trivially
+  verifiable.
+- `mmlu-pro` — a deterministic stratified 1000-question subset of the
+  TIGER-Lab/MMLU-Pro test split (Apache-2.0), proportional per category via
+  largest remainder, floor-stride by `question_id` inside each category,
+  shipped in `data/mmlu_pro_1000.jsonl`. Up to 10 options per question; the
+  model must end with `Answer: <letter>`; scoring is exact letter match with
+  tolerant extraction (bold/parenthesised tags, bare final-line letters,
+  last-tag-wins fallback in the visible text). The report includes
+  per-category accuracy.
+- `gpqa-diamond` — all 198 graduate-level "Google-proof" science questions of
+  the GPQA Diamond split (CC BY 4.0; biology, chemistry, physics), 4 options
+  per question assigned by a deterministic per-item shuffle (seeded by record
+  id, identical on every machine), same `Answer: <letter>` scoring as
+  `mmlu-pro`. This is the frontier-difficulty anchor; with only 198 items its
+  statistical resolution is coarse (~±5 pp paired), so read it alongside
+  `gsm8k` and `mmlu-pro`. The GPQA authors distribute the dataset as a
+  password-protected zip and ask that plaintext never be republished online
+  (anti-contamination), so this dataset is **not** shipped in `data/`: the
+  official zip is downloaded on first use (both the archive and the derived
+  JSONL are sha256-pinned) and cached under
+  `~/.cache/llm_decode_bench/datasets/` only. `.gitignore` guards against
+  committing a local copy; please keep it out of public repos.
+
+All dataset profiles default to temperature 0, `max_tokens` 131072 (a generous
+reasoning budget so a healthy baseline essentially never truncates and
+candidate `max_tokens` hits read as degradation; override with
+`--max-tokens`), fixed concurrency 30, no prefix-cache scout (prompts are
+unique), and **all dataset items**. If your server's `max_model_len` is at or
+below 128k, engines like vLLM reject requests whose prompt + `max_tokens`
+exceed the context window — pass a smaller `--max-tokens` in that case.
+`--profile-runs N` selects a deterministic evenly-spread N-item subset — the
+same N items every run, so subsets stay comparable across configurations.
+Item-level results (`item_id`, expected/parsed answer, per-item correctness,
+tokens) are stored in the output JSON. The headline metric is accuracy with a
+Wilson 95% interval; completion-token percentiles and `max_tokens` hits are
+reported alongside as early damage signals (a damaged quant usually inflates
+reasoning tokens before accuracy visibly drops).
+
+A request that hits the `max_tokens` limit while a thinking model is still
+reasoning — and therefore never emits an answer — is scored as **TRUNCATED**
+(glyph `⊘`), a distinct category from **unparseable (format)**, which is when
+the model *did* answer but the letter/number could not be read. Both still
+count as wrong, but TRUNCATED is a token-budget artifact, not a model failure:
+the report shows the count explicitly (`truncated (no answer)` and a
+`hit max_tokens` breakdown of how many produced no answer vs answered before
+the cap) so a high number is an unambiguous signal to raise `--max-tokens`
+rather than a misleading "unparseable". Because a damaged quant tends to think
+longer, a rising TRUNCATED count between two runs is itself a degradation
+signal, and the paired comparison reports it per side. The same treatment
+applies to the watchdog stops `STALL` and `TIMEOUT` (see the completion-stats
+section above).
+
+### Paired A/B Comparison
+
+`--compare-baseline previous.json` (with a dataset-profile run) or the
+standalone `--compare-baseline a.json --compare-candidate b.json` mode pairs
+runs **per item id** and reports: accuracy for both sides with Wilson 95%
+intervals, the accuracy delta, the exact item flips (correct only in baseline
+vs only in candidate), a two-sided exact McNemar p-value over the discordant
+pairs, per-category deltas (worst first), completion-token inflation, and
+`max_tokens`-hit counts. The comparison is embedded under `comparison` in the
+output JSON, including flip item ids for drill-down.
+
+Recommended protocol for quantization comparisons: keep the engine version and
+flags identical between runs, change only the checkpoint/quant config; run the
+full item set on each endpoint; run the profile twice against the *same*
+endpoint first — that self-flip rate is the noise floor (temperature 0 does not
+guarantee bitwise determinism under batching) that a real degradation must
+exceed. Paired McNemar statistics resolve roughly 1–2 pp differences on the
+full GSM8K set; a 30-run single-prompt profile cannot.
+
+### Tool-calling quality (tool-eval-bench)
+
+`--tool-eval` runs [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench)
+by SeraphimSerapis (MIT license) against the server the bench targets.
+tool-eval-bench sends 69 deterministic scenarios, plus 23 Hard Mode ones,
+through `/v1/chat/completions` with mock tools: tool selection, parameter
+precision, multi-step chains, refusal, error recovery, safety and prompt
+injection, large toolsets, planning and structured output. Each scenario
+scores pass (2 points), partial (1) or fail (0); the score is
+`points / max points × 100`. Scenarios the endpoint failed (timeout,
+connection error, 5xx) are left out of the score and lower the completion
+rate instead.
+
+The defaults are the community leaderboard settings, so
+
+```bash
+python3 llm_decode_bench.py --port 8000 --model glm-5.3-flash --tool-eval
+```
+
+runs tool-eval-bench with exactly the arguments of
+
+```bash
+tool-eval-bench --model glm-5.3-flash --base-url http://localhost:8000/ --backend vllm \
+  --hardmode --seed 42 --temperature 0 \
+  --parallel 4 --max-turns 30 --timeout 600 \
+  --no-live --json --json-file run.json
+```
+
+| Bench option | tool-eval-bench option |
+|---|---|
+| `--host`, `--port` | `--base-url http://<host>:<port>/` (a URL `--host` is used as given) |
+| `--model` (or the first served model, as in the other modes) | `--model` |
+| `--api-key` | `TOOL_EVAL_API_KEY` in its environment, so the key is not in the process list |
+| `--tool-eval-seed`, `--tool-eval-temperature`, `--tool-eval-parallel`, `--tool-eval-max-turns`, `--tool-eval-timeout`, `--[no-]tool-eval-hardmode` | `--seed`, `--temperature`, `--parallel`, `--max-turns`, `--timeout`, `--hardmode` |
+| `--tool-eval-args` | appended last; may not repeat the options above |
+
+`--backend vllm` is only a report label in tool-eval-bench; use
+`--tool-eval-args="--backend sglang"` for an SGLang server. Any changed
+setting or extra option is reported as custom settings instead of leaderboard
+settings. tool-eval-bench records the model name, the base URL (host
+masked), the settings, its own version and the server's deployment facts in
+the `config_fingerprint` that decides which runs are comparable. The trailing
+slash of `http://localhost:8000/` is kept so a run gets the same fingerprint as
+the leaderboard command on the same server.
+
+The server must have tool calling enabled (vLLM `--enable-auto-tool-choice`
+with the model's `--tool-call-parser`) and a context window that holds
+30-turn conversations.
+
+Reference: GLM-5.3-Flash NVFP4 (QAD checkpoint, W4A16 experts, MTP 3) on vLLM
+TP4, 4× RTX PRO 6000 Blackwell, Karmic Kraken beta of 2026-10-04, scores
+91/100 ★★★★★ (median of 12 runs, range 86–93), about 85 s per run. At
+`--parallel 4` identical runs are not identical: 17 of the 92 scenarios changed
+result between those runs, because batching changes the numerics even at
+temperature 0. Compare the mean of several runs; tool-eval-bench recommends
+`--parallel 1` for reproducible scores, which is not the leaderboard setting.
+Six of the runs went through `--tool-eval` and six ran the leaderboard command
+directly; all twelve have the same `config_fingerprint`, and their means (91.5
+and 90.2) differ less than that run-to-run noise.
+
+**Installation.** tool-eval-bench stays an external program; none of its code
+or scenarios is in this repository. The first `--tool-eval` run installs the
+pinned commit (`570951a7`, version `2.7.1.dev14+g570951a77`) with
+`pip install git+https://github.com/SeraphimSerapis/tool-eval-bench.git@<commit>`
+into its own virtual environment,
+`~/.cache/llm_decode_bench/tool-eval-bench/<commit>/venv` (or under
+`LLM_BENCH_CACHE_DIR`), and later runs reuse it. It needs Python 3.11+, git,
+`venv` and network access to GitHub and PyPI once; the pinned commit's direct
+dependencies are pinned too. The Python environment that runs the bench is
+never modified, which matters in the serving images, where `python3` is the
+server's own venv. Without network the run stops with a clear error before
+anything is benchmarked. To run another version, pass a commit, tag or branch
+with `--tool-eval-ref` (or `LLM_BENCH_TOOL_EVAL_REF`); branches and tags are
+resolved to a commit with `git ls-remote`, and offline the commit they resolved
+to on an earlier run is reused. `LLM_BENCH_TOOL_EVAL_REPO` points at a mirror
+(URL, `user@host:path` or local path), and `--tool-eval-bin` runs a
+tool-eval-bench you installed yourself.
+
+**Output.** The terminal shows one line per finished scenario, then the score
+and rating, pass/partial/fail counts and pass rate, completion rate, safety
+warnings, responsiveness/deployability, the per-category table, the Hard Mode
+capability table and the scenarios that did not pass. `--output` gets
+`metadata` (`mode: tool_eval`), `tool_eval` (status, settings, tool-eval-bench
+version and commit, the exact command, duration and the summary) and
+`tool_eval_raw`, tool-eval-bench's JSON as it wrote it. Its own files go to
+`<output>.tool-eval/` next to `--output`: `run.json`, `progress.jsonl` (its
+progress events), and `runs/YYYY/MM/<run_id>.md` (the Markdown report with every
+conversation) plus `data/benchmarks.sqlite`, the files it keeps in the
+directory it runs in. A failed run (server unreachable, install failure,
+tool-eval-bench error, unreadable JSON) still writes `--output` with
+`tool_eval.status: failed` and `tool_eval.error`, and exits with code 1.
+
+### Client Latency Metrics
+
+Client latency metrics follow OpenAI streaming semantics in both modes:
+
+- TTFT is time from request start to first streamed content token.
+- TTST is time from first streamed content token to second streamed content token.
+- Request latency ends at the last streamed content token, not at the usage-only chunk or HTTP close.
+- ITL is `(last_content_token_time - first_content_token_time) / (output_tokens - 1)`.
+- Per-user output throughput is `1 / ITL`.
+
+Sustained-duration cells may stop streams at the measurement boundary. In that
+case ITL is still valid if at least two content tokens were observed, because it
+uses only first/last received token timestamps and never uses cancel or HTTP
+close time as a synthetic last token. Full request latency remains available
+only for completed streams.
+
+The main aggregate matrix keeps latency compact: a wide terminal shows cells
+like `63.1 1k/14`, meaning aggregate decode throughput `63.1 tok/s`, TTFT
+`~1000 ms`, and ITL `14 ms`. Per-request throughput and request latency are
+shown in separate per-cell matrices. Completion/sample counts are preserved in
+JSON but intentionally not printed in the default report because they are mostly
+diagnostic and easy to misread as benchmark failures.
+
+### Live Hardware Panel
+
+The live dashboard samples `nvidia-smi` while the benchmark runs. It shows GPU
+SM utilization, memory-controller utilization, VRAM used/total, watts/power
+limit, temperature, SM/memory clocks, PCIe rx/tx MB/s, and CPU utilization.
+
+VRAM usage and memory-controller utilization are intentionally separate: VRAM is
+capacity pressure, while `Mem` is memory-controller activity. PCIe rx/tx comes
+from `nvidia-smi dmon -s t`; treat it as a coarse live diagnostic signal, not a
+per-collective NCCL profiler.
+
+When hardware sampling is active, every measured decode cell also gets a compact
+hardware summary in JSON and in the final report. Startup diagnostics are saved
+to JSON as well: benchmark arguments, relevant `NCCL_`/`VLLM_`/`SGLANG_`/`CUDA_`
+environment variables, `uname`, GPU query output, and `nvidia-smi topo -m`.
+
+The benchmark also checks the NVIDIA runtime P2P override at startup by reading
+`/proc/driver/nvidia/params`, not just the modprobe file. A green startup panel
+means the expected `ForceP2P=0x11`, `RMForceP2PType=1`, `RMPcieP2PType=2`,
+`GrdmaPciTopoCheckOverride=1`, and `EnableResizableBar=1` values are actually
+loaded. If they are missing, the panel prints the suggested
+`/etc/modprobe.d/nvidia-p2p-override.conf` line and reminds that the NVIDIA
+module must be reloaded or the host rebooted before the file takes effect.
+
+For a deeper fabric sanity check, run:
+
+```bash
+python3 llm_decode_bench.py --p2pmark-only
+python3 llm_decode_bench.py --p2pmark --p2pmark-mode all --port 8000
+```
+
+The bundled `tools/p2pmark/llm_p2pmark` CUDA binary measures CUDA peer memcpy
+bandwidth, peer-distance topology behavior, ring bandwidth, all-to-all stress,
+dependent remote-read latency, and allreduce behavior across visible GPUs. The
+default allreduce sweep compares custom PCIe allreduce vs NCCL from 256 B to
+1 MiB, with winner and speedup ratio per size. Use
+`--p2pmark-allreduce-sizes-mb 1,2,4,8,16,32,64` for a larger MiB-only sweep.
+The default console report is intentionally compact: one fabric summary, one
+peer-distance topology table, one allreduce table, and one per-GPU compact view.
+Use `--p2pmark-detail` to print full matrices and pair-pattern tables; JSON
+output always contains the full raw data.
+
+For single-file installs, `llm_decode_bench.py` includes a compressed Linux
+x86_64 CUDA/NCCL fallback helper. If the sidecar binary is missing, the script
+extracts it to `~/.cache/llm_decode_bench/bin/`. The fallback still depends on
+compatible runtime libraries (`libcudart.so.13` and `libnccl.so.2`). Build a
+local sidecar with `make -C tools/p2pmark` or pass `--p2pmark-bin` if the
+runtime does not match.
+
+For AMD dual-socket hosts, run:
+
+```bash
+python3 llm_decode_bench.py --amd-fabric-only
+python3 llm_decode_bench.py --amd-fabric --port 8000
+```
+
+The bundled `tools/amd_fabric/llm_amd_fabric` helper measures CPU execution
+NUMA node vs memory allocation NUMA node. It reports NUMA distance, read/write
+bandwidth, memcpy bandwidth, dependent pointer-chase latency, and a
+bidirectional remote-read test for 2-socket systems. Off-diagonal cells are the
+practical CPU-socket fabric signal.
+
+The default console report is compact: one summary panel and one combined
+`CPU node -> memory node` table. Use `--amd-fabric-detail` to print separate
+distance, read, write, memcpy, and latency matrices; JSON output always contains
+the full raw data.
+
+In the compact table, `N0->N0` means CPU threads pinned to NUMA node 0 accessing
+memory allocated on NUMA node 0. That is local socket traffic. Cross-socket
+fabric traffic is shown by off-diagonal rows such as `N0->N1` and `N1->N0`.
+The helper also reports bidirectional remote read/write/memcpy saturation, which
+runs both socket directions concurrently and is the more relevant aggregate
+fabric number.
+
+Linux does not expose a portable active xGMI socket-link count through standard
+sysfs/procfs interfaces. The report therefore labels active xGMI links as "not
+exposed" and treats measured remote NUMA bandwidth as authoritative. When
+Linux `perf list --details data_fabric` exposes cross-socket `link_N` counter
+slots, the report prints the number of visible DF link counter slots as a useful
+hint, but this is still not the same as a decoded active/trained xGMI link count.
+On AMD EPYC 9004/9005 2P platforms the expected link count is board-dependent;
+NPS1 reference topologies commonly use four board-wired xGMI links.
+
+Build the helper with `make -C tools/amd_fabric` or pass `--amd-fabric-bin` if
+you want to use a custom binary.
+
+### Prefill Metrics
+
+Prefill headline throughput is client `prompt_tokens / TTFT`. In the default
+mode these samples come from decode scout requests plus any scout-only extra
+contexts, so the benchmark no longer pays for a repeated standalone prefill
+phase. If Prometheus exposes uncontaminated prefill counters, standalone prefill
+mode can also show server-side throughput as validation. Prometheus is not
+required for the headline prefill number.
+
+See [methodology and tool parity notes](docs/aiperf-parity-report-2026-04-26.md) for current comparison data and known workload-parity limits.
+
+## Output
+
+Results are saved as JSON with metadata and per-cell throughput data:
+
+```json
+{
+  "metadata": {
+    "version": "0.4.8",
+    "engine": "vllm",
+    "model": "Qwen3_5-397B-A17B-NVFP4",
+    "timestamp": "2026-03-13T00:30:53",
+    "decode_mode": "duration",
+    "primary_decode_layer": "sustained_decode",
+    "request_count": 0,
+    "warmup_request_count": 0,
+    "run_burst": true,
+    "burst_e2e_status": "enabled",
+    "concurrency_levels": [1, 2, 4, 8, 16, 32, 64, 128],
+    "context_lengths": [0, 16384, 32768, 65536, 131072]
+  },
+  "prefill": { ... },
+  "results": [ ... ],
+  "summary_table": { ... },
+  "burst_results": [ ... ],
+  "burst_summary_table": { ... },
+  "mixed_prefill": { ... },
+  "methodology": { ... }
+}
+```
+
+## Additional tools
+
+### `llm_cjk_watchdog.py` — CJK character leak detector
+
+A standalone streaming watchdog that runs chat completions against any OpenAI-compatible endpoint and watches for unexpected Chinese / CJK Han ideographs in the output. Useful for catching model drift, KV-cache corruption, quantization damage, or other failure modes where an English task starts emitting Chinese tokens.
+
+```bash
+# single shot against local SGLang/vLLM on :5000
+python3 llm_cjk_watchdog.py
+
+# loop until the model leaks a Chinese character
+python3 llm_cjk_watchdog.py --loop
+
+# remote OpenAI-compatible endpoint
+python3 llm_cjk_watchdog.py --host https://api.together.xyz \
+    --api-key $TOGETHER_API_KEY --model meta-llama/llama-3-70b
+
+# simulate a 40k-token input context
+python3 llm_cjk_watchdog.py --context-tokens 40000 --max-tokens 2000
+```
+
+Features:
+
+- **Loop mode** — runs indefinitely, aborts the stream the moment a CJK character appears
+- **Two-row live overlay** pinned to the bottom of the terminal: row 1 shows the current iteration's live tok/s, tokens, elapsed time, and CJK counter; row 2 shows last-iteration and cumulative stats so they never scroll away
+- **Precise tok/s** — uses `stream_options.continuous_usage_stats` so the live readout is the exact `completion_tokens` reported by the server, not an estimate from chunk counts
+- **Padding context** — optional synthetic input of configurable token size to reproduce long-context failure modes
+- **Exit code 2** when CJK characters are detected (scripting-friendly)
+
+Requires only `requests`. See `python3 llm_cjk_watchdog.py --help` for the full CLI.
+
+## License
+
+MIT
